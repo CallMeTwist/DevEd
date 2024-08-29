@@ -1,0 +1,162 @@
+return compareModulesByIdentifier(a[a.length - 1], b[b.length - 1]);
+			}
+		};
+
+		modulesByChunkGroup.sort(compareModuleLists);
+
+		/** @type {Module[]} */
+		const finalModules = [];
+
+		for (;;) {
+			const failedModules = new Set();
+			const list = modulesByChunkGroup[0].list;
+			if (list.length === 0) {
+				// done, everything empty
+				break;
+			}
+			/** @type {Module} */
+			let selectedModule = list[list.length - 1];
+			let hasFailed = undefined;
+			outer: for (;;) {
+				for (const { list, set } of modulesByChunkGroup) {
+					if (list.length === 0) continue;
+					const lastModule = list[list.length - 1];
+					if (lastModule === selectedModule) continue;
+					if (!set.has(selectedModule)) continue;
+					failedModules.add(selectedModule);
+					if (failedModules.has(lastModule)) {
+						// There is a conflict, try other alternatives
+						hasFailed = lastModule;
+						continue;
+					}
+					selectedModule = lastModule;
+					hasFailed = false;
+					continue outer; // restart
+				}
+				break;
+			}
+			if (hasFailed) {
+				// There is a not resolve-able conflict with the selectedModule
+				if (compilation) {
+					// TODO print better warning
+					compilation.warnings.push(
+						new WebpackError(
+							`chunk ${chunk.name || chunk.id}\nConflicting order between ${
+								/** @type {Module} */
+								(hasFailed).readableIdentifier(compilation.requestShortener)
+							} and ${selectedModule.readableIdentifier(
+								compilation.requestShortener
+							)}`
+						)
+					);
+				}
+				selectedModule = /** @type {Module} */ (hasFailed);
+			}
+			// Insert the selected module into the final modules list
+			finalModules.push(selectedModule);
+			// Remove the selected module from all lists
+			for (const { list, set } of modulesByChunkGroup) {
+				const lastModule = list[list.length - 1];
+				if (lastModule === selectedModule) list.pop();
+				else if (hasFailed && set.has(selectedModule)) {
+					const idx = list.indexOf(selectedModule);
+					if (idx >= 0) list.splice(idx, 1);
+				}
+			}
+			modulesByChunkGroup.sort(compareModuleLists);
+		}
+		return finalModules;
+	}
+
+	/**
+	 * @param {Chunk} chunk chunk
+	 * @param {ChunkGraph} chunkGraph chunk graph
+	 * @param {Compilation} compilation compilation
+	 * @returns {Module[]} ordered css modules
+	 */
+	getOrderedChunkCssModules(chunk, chunkGraph, compilation) {
+		return [
+			...this.getModulesInOrder(
+				chunk,
+				/** @type {Iterable<Module>} */
+				(
+					chunkGraph.getOrderedChunkModulesIterableBySourceType(
+						chunk,
+						"css-import",
+						compareModulesByIdentifier
+					)
+				),
+				compilation
+			),
+			...this.getModulesInOrder(
+				chunk,
+				/** @type {Iterable<Module>} */
+				(
+					chunkGraph.getOrderedChunkModulesIterableBySourceType(
+						chunk,
+						"css",
+						compareModulesByIdentifier
+					)
+				),
+				compilation
+			)
+		];
+	}
+
+	/**
+	 * @param {Object} options options
+	 * @param {string | undefined} options.uniqueName unique name
+	 * @param {Chunk} options.chunk chunk
+	 * @param {ChunkGraph} options.chunkGraph chunk graph
+	 * @param {CodeGenerationResults} options.codeGenerationResults code generation results
+	 * @param {CssModule[]} options.modules ordered css modules
+	 * @returns {Source} generated source
+	 */
+	renderChunk({
+		uniqueName,
+		chunk,
+		chunkGraph,
+		codeGenerationResults,
+		modules
+	}) {
+		const source = new ConcatSource();
+		/** @type {string[]} */
+		const metaData = [];
+		for (const module of modules) {
+			try {
+				const codeGenResult = codeGenerationResults.get(module, chunk.runtime);
+
+				let moduleSource =
+					/** @type {Source} */
+					(
+						codeGenResult.sources.get("css") ||
+							codeGenResult.sources.get("css-import")
+					);
+
+				let inheritance = [[module.cssLayer, module.supports, module.media]];
+
+				if (module.inheritance) {
+					inheritance.push(...module.inheritance);
+				}
+
+				for (let i = 0; i < inheritance.length; i++) {
+					const layer = inheritance[i][0];
+					const supports = inheritance[i][1];
+					const media = inheritance[i][2];
+
+					if (media) {
+						moduleSource = new ConcatSource(
+							`@media ${media} {\n`,
+							new PrefixSource("\t", moduleSource),
+							"}\n"
+						);
+					}
+
+					if (supports) {
+						moduleSource = new ConcatSource(
+							`@supports (${supports}) {\n`,
+							new PrefixSource("\t", moduleSource),
+							"}\n"
+						);
+					}
+
